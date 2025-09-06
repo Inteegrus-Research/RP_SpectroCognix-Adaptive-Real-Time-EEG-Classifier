@@ -1,0 +1,990 @@
+import os
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable problematic MKL optimizations
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'   # Reduce TensorFlow verbosity
+
+import time
+import threading
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import PySimpleGUI as sg
+import tensorflow as tf
+from scipy.signal import butter, lfilter, iirnotch, welch
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import joblib
+import traceback
+import sys
+import pylsl
+import seaborn as sns
+from datetime import datetime
+import warnings
+
+# Suppress warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# === Configuration ===
+DATA_DIR = 'data'
+MODEL_DIR = 'models'
+LOG_DIR = 'logs'
+BENCHMARK_DIR = 'benchmarks'
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(BENCHMARK_DIR, exist_ok=True)
+
+MODEL_CNN = os.path.join(MODEL_DIR, 'project4_cnn_model.keras')
+MODEL_SVM = os.path.join(MODEL_DIR, 'project4_svm.pkl')
+
+CHANNELS = 8
+FS = 256  # Sampling frequency (Hz)
+DEFAULT_WIN_SIZE = 2  # Default window size in seconds
+WIN_LEN = FS * DEFAULT_WIN_SIZE  # Samples in window
+
+# === Preprocessing Functions ===
+def butter_bandpass(low, high, fs, order=4):
+    nyq = 0.5 * fs
+    low = low / nyq
+    high = high / nyq
+    b, a = butter(order, [low, high], btype='band')
+    return b, a
+
+def notch_filter(fs, freq=50, q=30):
+    nyq = 0.5 * fs
+    freq = freq / nyq
+    b, a = iirnotch(freq, q)
+    return b, a
+
+def preprocess(sig):
+    """Apply bandpass and notch filtering to EEG signal"""
+    # Bandpass filter (1-45 Hz)
+    b, a = butter_bandpass(1, 45, FS)
+    filtered = lfilter(b, a, sig)
+    
+    # Notch filter (50 Hz)
+    bn, an = notch_filter(FS)
+    filtered = lfilter(bn, an, filtered)
+    
+    # Remove DC offset
+    return filtered - np.mean(filtered)
+
+# === Model Architecture ===
+def build_cnn(input_shape):
+    """Build 1D CNN model for EEG classification with adaptive pooling"""
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=input_shape),
+        tf.keras.layers.Conv1D(32, kernel_size=32, strides=4, 
+                               padding='same', activation='relu'),
+        tf.keras.layers.AveragePooling1D(pool_size=2),  # Adaptive pooling
+        tf.keras.layers.Conv1D(64, kernel_size=16, strides=2, 
+                               padding='same', activation='relu'),
+        tf.keras.layers.AveragePooling1D(pool_size=2),  # Adaptive pooling
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(128, activation='relu'),
+        tf.keras.layers.Dropout(0.5),
+        tf.keras.layers.Dense(2, activation='softmax')
+    ])
+    
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
+                 loss='sparse_categorical_crossentropy',
+                 metrics=['accuracy'])
+    return model
+
+# === Data Generation ===
+def generate_sample_data():
+    """Generate sample EEG data with validation checks"""
+    n_samples = FS * 60 * 5  # 5 minutes of data per file
+    
+    for label, name in [(0, 'low'), (1, 'high')]:
+        for i in range(3):  # 3 files per class
+            # Create filename with valid characters
+            filename = f"eeg_{name}_{i+1}.csv"
+            filepath = os.path.join(DATA_DIR, filename)
+            
+            # Skip if file already exists
+            if os.path.exists(filepath):
+                continue
+                
+            data = np.zeros((n_samples, CHANNELS))
+            
+            # Simulate EEG with different frequency characteristics
+            t = np.arange(n_samples) / FS
+            for ch in range(CHANNELS):
+                # Base signal (alpha/beta waves)
+                base = 0.5 * np.sin(2 * np.pi * 10 * t) + 0.3 * np.sin(2 * np.pi * 20 * t)
+                
+                # Add class-specific characteristics
+                if label == 1:  # High cognitive load
+                    base += 0.4 * np.sin(2 * np.pi * 40 * t) + 0.2 * np.random.normal(size=n_samples)
+                else:  # Low cognitive load
+                    base += 0.1 * np.sin(2 * np.pi * 5 * t) + 0.1 * np.random.normal(size=n_samples)
+                
+                # Add noise and drift
+                data[:, ch] = base + 0.05 * np.random.normal(size=n_samples) + 0.01 * t
+                
+            # Create DataFrame and save
+            df = pd.DataFrame(data, columns=[f'Channel_{i}' for i in range(CHANNELS)])
+            df.to_csv(filepath, index=False)
+            
+    return True
+
+# === Training Routine ===
+def train_models(window):
+    """Train both CNN and SVM models with comprehensive validation"""
+    # Create sample data if none exists
+    if not os.listdir(DATA_DIR):
+        window['-STATUS-'].update('Generating sample EEG data...')
+        if not generate_sample_data():
+            return 0, 0, "Failed to generate sample data"
+    
+    # Load and prepare dataset
+    X_cnn, X_svm, y = [], [], []
+    files = [f for f in os.listdir(DATA_DIR) if f.endswith('.csv')]
+    
+    if not files:
+        return 0, 0, "No valid EEG files found in data directory"
+    
+    window['-STATUS-'].update(f'Processing {len(files)} EEG files...')
+    window.refresh()
+    
+    valid_files = 0
+    for file in files:
+        try:
+            filepath = os.path.join(DATA_DIR, file)
+            df = pd.read_csv(filepath)
+            
+            # Validate data shape
+            if df.shape[1] != CHANNELS:
+                window['-STATUS-'].update(
+                    f"Skipping {file}: Expected {CHANNELS} channels, got {df.shape[1]}"
+                )
+                continue
+                
+            # Get label from filename
+            label = 0 if 'low' in file.lower() else 1
+            data = df.values.T  # Transpose to (channels, samples)
+            
+            # Create windows with 50% overlap
+            step = WIN_LEN // 2
+            num_windows = (data.shape[1] - WIN_LEN) // step + 1
+            
+            if num_windows < 1:
+                window['-STATUS-'].update(
+                    f"Skipping {file}: Data too short ({data.shape[1]} samples) for window size {WIN_LEN}"
+                )
+                continue
+                
+            valid_files += 1
+            
+            for i in range(0, data.shape[1] - WIN_LEN + 1, step):
+                window_data = data[:, i:i+WIN_LEN]
+                
+                # Preprocess for CNN
+                proc_window = np.stack([preprocess(ch) for ch in window_data])
+                X_cnn.append(proc_window.T)
+                
+                # Feature extraction for SVM
+                freqs, psd = welch(window_data, fs=FS, nperseg=WIN_LEN, axis=1)
+                features = []
+                for ch in range(CHANNELS):
+                    for band in [(1, 4), (4, 7), (8, 12), (13, 30), (30, 45)]:
+                        band_mask = (freqs >= band[0]) & (freqs <= band[1])
+                        band_power = np.trapz(psd[ch][band_mask], freqs[band_mask])
+                        features.append(band_power)
+                X_svm.append(features)
+                y.append(label)
+                
+        except Exception as e:
+            window['-STATUS-'].update(f"Error processing {file}: {str(e)}")
+            continue
+    
+    # Check if we have enough data
+    if not X_cnn or not X_svm:
+        return 0, 0, "No valid windows extracted from data"
+    
+    window['-STATUS-'].update(f'Training models with {len(X_cnn)} samples...')
+    window.refresh()
+    
+    # Convert to arrays
+    X_cnn = np.array(X_cnn)
+    X_svm = np.array(X_svm)
+    y = np.array(y)
+    
+    # Train-test split with validation
+    try:
+        (X_cnn_tr, X_cnn_te, X_svm_tr, X_svm_te, 
+         y_tr, y_te) = train_test_split(X_cnn, X_svm, y, test_size=0.2, 
+                                        stratify=y, random_state=42)
+    except Exception as e:
+        return 0, 0, f"Train-test split failed: {str(e)}"
+    
+    # Train CNN
+    try:
+        cnn = build_cnn((WIN_LEN, CHANNELS))
+        cnn.fit(X_cnn_tr, y_tr, validation_data=(X_cnn_te, y_te), 
+                epochs=15, batch_size=32, verbose=0)
+        cnn.save(MODEL_CNN)
+        cnn_acc = cnn.evaluate(X_cnn_te, y_te, verbose=0)[1]
+    except Exception as e:
+        cnn_acc = 0
+        window['-STATUS-'].update(f"CNN training failed: {str(e)}")
+    
+    # Train SVM
+    try:
+        svm = make_pipeline(
+            StandardScaler(),
+            SVC(kernel='rbf', C=1.0, gamma='scale', probability=True)
+        )
+        svm.fit(X_svm_tr, y_tr)
+        joblib.dump(svm, MODEL_SVM)
+        svm_acc = svm.score(X_svm_te, y_te)
+    except Exception as e:
+        svm_acc = 0
+        window['-STATUS-'].update(f"SVM training failed: {str(e)}")
+    
+    # Return results
+    status = (f"Training complete! CNN Acc: {cnn_acc:.2f}, SVM Acc: {svm_acc:.2f}\n"
+              f"Trained on {valid_files} files with {len(X_cnn)} windows")
+    return cnn_acc, svm_acc, status
+
+# === LSL Integration ===
+class LSLStream:
+    def __init__(self, window):
+        self.window = window
+        self.inlet = None
+        self.running = False
+        
+    def connect(self):
+        try:
+            # Resolve EEG streams
+            streams = pylsl.resolve_stream('type', 'EEG')
+            if not streams:
+                self.window['-STATUS-'].print("No EEG streams found via LSL")
+                return False
+                
+            # Connect to the first stream
+            self.inlet = pylsl.StreamInlet(streams[0])
+            info = self.inlet.info()
+            self.window['-STATUS-'].print(f"Connected to LSL stream: {info.name()}")
+            return True
+        except Exception as e:
+            self.window['-STATUS-'].print(f"LSL connection error: {str(e)}")
+            return False
+            
+    def get_window(self, win_len):
+        """Get a window of EEG data from LSL stream"""
+        samples = []
+        start_time = pylsl.local_clock()
+        
+        # Collect samples until we have a full window
+        while len(samples) < win_len:
+            sample, timestamp = self.inlet.pull_sample(timeout=0.1)
+            if sample:
+                samples.append(sample)
+                
+        # Convert to numpy array and transpose
+        return np.array(samples).T
+    
+    def start(self):
+        """Start LSL connection"""
+        if not self.connect():
+            return False
+        self.running = True
+        return True
+        
+    def stop(self):
+        """Stop LSL connection"""
+        if self.inlet:
+            self.inlet.close_stream()
+        self.running = False
+
+# === GUI Layout ===
+def create_window():
+    """Create the main application window"""
+    sg.theme('DarkBlue14')
+    
+    # Create matplotlib figures
+    fig_ts = plt.figure(figsize=(10, 6))
+    ax_ts = fig_ts.subplots(4, 2, sharex=True)
+    fig_ts.tight_layout(rect=[0.03, 0.03, 0.97, 0.97])
+    fig_ts.suptitle('EEG Time Series', fontsize=12)
+    
+    fig_psd = plt.figure(figsize=(6, 4))
+    ax_psd = fig_psd.subplots(1, 1)
+    ax_psd.set_title('Power Spectral Density', fontsize=10)
+    ax_psd.set_xlabel('Frequency (Hz)', fontsize=9)
+    ax_psd.set_ylabel('Power', fontsize=9)
+    fig_psd.tight_layout()
+    
+    # File selection dropdown
+    file_list = ['All Files (Loop)'] + sorted([f for f in os.listdir(DATA_DIR) if f.endswith('.csv')])
+    
+    # Define layout
+    control_col = sg.Column([
+        [sg.Text('Adaptive EEG Classifier', font=('Arial', 18, 'bold'), pad=((0, 0), (0, 20)))],
+        [sg.Text('Data Source:', font=('Arial', 10))],
+        [sg.Radio('Simulation', "SOURCE", default=True, key='-SIMULATION-', font=('Arial', 9)),
+         sg.Radio('Live EEG (LSL)', "SOURCE", key='-LIVE-', font=('Arial', 9))],
+        [sg.Text('Model Selection:', font=('Arial', 10))],
+        [sg.Combo(['CNN', 'SVM'], default_value='CNN', key='-MODEL-', size=15, font=('Arial', 9))],
+        [sg.HorizontalSeparator(pad=(0, 10))],
+        [sg.Text('Noise Level:', font=('Arial', 9))],
+        [sg.Slider(range=(0, 100), default_value=20, orientation='h', 
+                  key='-NOISE-', size=(20, 15), enable_events=True)],
+        [sg.Text('Speed (Hz):', font=('Arial', 9))],
+        [sg.Slider(range=(1, 30), default_value=10, orientation='h', 
+                  key='-SPEED-', size=(20, 15))],
+        [sg.Text('Confidence Threshold (%):', font=('Arial', 9))],
+        [sg.Slider(range=(0, 100), default_value=70, orientation='h', 
+                  key='-THRESHOLD-', size=(20, 15), enable_events=True)],
+        [sg.Text('Window Size (s):', font=('Arial', 9))],
+        [sg.Combo(['1', '2', '3'], default_value='2', key='-WIN-SIZE-', font=('Arial', 9))],
+        [sg.Text('Select File:', font=('Arial', 9))],
+        [sg.Combo(file_list, default_value='All Files (Loop)', 
+                 key='-FILE-SELECT-', size=25, font=('Arial', 9))],
+        [sg.HorizontalSeparator(pad=(0, 10))],
+        [sg.Button('Start', size=10, font=('Arial', 9)), 
+         sg.Button('Stop', disabled=True, size=10, font=('Arial', 9))],
+        [sg.Button('Train Models', size=15, font=('Arial', 9)), 
+         sg.Button('Run Benchmark', size=15, font=('Arial', 9)), 
+         sg.Button('Exit', size=10, font=('Arial', 9))],
+        [sg.HorizontalSeparator(pad=(0, 10))],
+        [sg.Text('Status:', font=('Arial', 10, 'bold'))],
+        [sg.Multiline('System ready. Load models or train first.', 
+                     size=(30, 5), key='-STATUS-', disabled=True,
+                     autoscroll=True, font=('Arial', 9))]
+    ], pad=(10, 10))
+    
+    display_col = sg.Column([
+        [sg.Canvas(key='-TS-CANVAS-')],
+        [sg.Canvas(key='-PSD-CANVAS-')],
+        [sg.HorizontalSeparator()],
+        [sg.Text('Prediction:', font=('Arial', 10)), 
+         sg.Text('N/A', size=10, key='-PREDICTION-', font=('Arial', 12, 'bold')),
+         sg.ProgressBar(100, orientation='h', size=(20, 20), key='-CONFIDENCE-')],
+        [sg.Text('Latency:', font=('Arial', 10)), sg.Text('0.0 ms', key='-LATENCY-', font=('Arial', 9))],
+        [sg.Text('Active Model:', font=('Arial', 10)), sg.Text('None', key='-MODEL-ACTIVE-', font=('Arial', 9))],
+        [sg.Text('Data Source:', font=('Arial', 10)), sg.Text('Simulation', key='-SOURCE-ACTIVE-', font=('Arial', 9))],
+        [sg.Button('Save Log', key='-SAVE-LOG-', font=('Arial', 9)),
+         sg.Button('Show Metrics', key='-SHOW-METRICS-', font=('Arial', 9))]
+    ], pad=(10, 10))
+    
+    metrics_col = sg.Column([
+        [sg.Canvas(key='-METRICS-CANVAS-', size=(600, 400))],
+        [sg.Text('Benchmark Results:', font=('Arial', 11, 'bold'))],
+        [sg.Multiline('No benchmark data yet', size=(50, 10), key='-BENCHMARK-RESULTS-', disabled=True, font=('Arial', 9))]
+    ], pad=(10, 10), visible=False, key='-METRICS-COL-')
+    
+    layout = [
+        [control_col, display_col],
+        [metrics_col]
+    ]
+    
+    window = sg.Window('EEG Classifier - Phase 2/3', 
+                      layout, finalize=True, resizable=True)
+    
+    # Embed matplotlib figures
+    ts_canvas = FigureCanvasTkAgg(fig_ts, window['-TS-CANVAS-'].TKCanvas)
+    ts_canvas.draw()
+    ts_canvas.get_tk_widget().pack(side='top', fill='both', expand=1)
+    
+    psd_canvas = FigureCanvasTkAgg(fig_psd, window['-PSD-CANVAS-'].TKCanvas)
+    psd_canvas.draw()
+    psd_canvas.get_tk_widget().pack(side='top', fill='both', expand=1)
+    
+    return window, fig_ts, ax_ts, fig_psd, ax_psd
+
+# === Real-time Processing Thread ===
+class EEGProcessor:
+    def __init__(self, window):
+        self.running = False
+        self.thread = None
+        self.log = []
+        self.data_files = []
+        self.current_data = None
+        self.file_index = 0
+        self.position = 0
+        self.cnn_model = None
+        self.svm_model = None
+        self.active_model = None
+        self.window = window
+        self.lsl_stream = LSLStream(window)
+        self.win_len = WIN_LEN
+        self.confidence_history = []
+        self.latency_history = []
+        self.load_models()
+        self.load_data()
+        
+    def load_models(self):
+        """Load pre-trained models if available"""
+        try:
+            if os.path.exists(MODEL_CNN):
+                self.cnn_model = tf.keras.models.load_model(MODEL_CNN)
+                self.window['-STATUS-'].print("CNN model loaded successfully")
+            else:
+                self.window['-STATUS-'].print("CNN model not found")
+                
+            if os.path.exists(MODEL_SVM):
+                self.svm_model = joblib.load(MODEL_SVM)
+                self.window['-STATUS-'].print("SVM model loaded successfully")
+            else:
+                self.window['-STATUS-'].print("SVM model not found")
+                
+        except Exception as e:
+            self.window['-STATUS-'].print(f"Model loading error: {str(e)}")
+    
+    def load_data(self):
+        """Load EEG data from CSV files"""
+        try:
+            self.data_files = [f for f in os.listdir(DATA_DIR) if f.endswith('.csv')]
+            if not self.data_files:
+                self.window['-STATUS-'].print("No EEG data files found. Generating sample data...")
+                generate_sample_data()
+                self.data_files = [f for f in os.listdir(DATA_DIR) if f.endswith('.csv')]
+                if not self.data_files:
+                    raise Exception("Failed to generate sample data")
+                    
+            self.window['-STATUS-'].print(f"Loaded {len(self.data_files)} EEG files")
+            return True
+            
+        except Exception as e:
+            self.window['-STATUS-'].print(f"Data loading error: {str(e)}")
+            return False
+    
+    def start(self, ax_ts, ax_psd, params):
+        """Start the real-time processing thread"""
+        # Store parameters for thread
+        self.current_params = params
+        model_type = params['model_type']
+        win_size = int(params['win_size'])
+        self.win_len = win_size * FS
+        
+        # Set active model
+        if model_type == 'CNN' and self.cnn_model:
+            self.active_model = 'CNN'
+            self.window['-MODEL-ACTIVE-'].update('CNN (Loaded)')
+        elif model_type == 'SVM' and self.svm_model:
+            self.active_model = 'SVM'
+            self.window['-MODEL-ACTIVE-'].update('SVM (Loaded)')
+        else:
+            self.window['-STATUS-'].print('Model not available!')
+            return False
+            
+        # Set data source
+        if params['source'] == 'simulation':
+            self.window['-SOURCE-ACTIVE-'].update('Simulation')
+            if not self.data_files:
+                if not self.load_data():
+                    return False
+                
+            # Get selected file
+            selected_file = params['selected_file']
+            if selected_file != 'All Files (Loop)':
+                if selected_file in self.data_files:
+                    self.data_files = [selected_file]
+                else:
+                    sg.popup_error(f"Selected file not found: {selected_file}")
+                    return False
+                    
+            # Load initial data file
+            self.file_index = 0
+            self.position = 0
+            if not self.load_current_file():
+                return False
+        else:
+            self.window['-SOURCE-ACTIVE-'].update('Live EEG (LSL)')
+            if not self.lsl_stream.start():
+                return False
+                
+        try:
+            self.running = True
+            self.thread = threading.Thread(
+                target=self.process, 
+                args=(ax_ts, ax_psd),
+                daemon=True
+            )
+            self.thread.start()
+            return True
+            
+        except Exception as e:
+            self.window['-STATUS-'].print(f"Error starting processing thread: {str(e)}")
+            return False
+    
+    def stop(self):
+        """Stop the processing thread"""
+        self.running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        self.lsl_stream.stop()
+    
+    def process(self, ax_ts, ax_psd):
+        """Real-time processing loop"""
+        try:
+            # Use parameters stored in main thread
+            params = self.current_params
+            noise_level = params['noise_level'] / 1000.0
+            speed = params['speed']
+            threshold = params['threshold'] / 100.0
+            step_size = max(1, self.win_len // 4)  # Ensure at least 1
+            
+            while self.running:
+                start_time = time.time()
+                
+                # Get EEG data based on source
+                if params['source'] == 'simulation':
+                    # Check if we need to switch to next file
+                    if self.position + self.win_len > self.current_data.shape[1]:
+                        self.file_index = (self.file_index + 1) % len(self.data_files)
+                        self.position = 0
+                        self.load_current_file()
+                    
+                    # Extract current window
+                    window_data = self.current_data[:, self.position:self.position+self.win_len]
+                    self.position += step_size
+                    
+                    # Add noise
+                    noise = noise_level * np.random.normal(size=window_data.shape)
+                    noisy_data = window_data + noise
+                    
+                    # Preprocess
+                    processed = np.array([preprocess(ch) for ch in noisy_data])
+                    current_file = self.data_files[self.file_index]
+                    
+                else:  # Live EEG
+                    window_data = self.lsl_stream.get_window(self.win_len)
+                    processed = np.array([preprocess(ch) for ch in window_data])
+                    current_file = "Live EEG"
+                
+                # Update time series plot
+                for i, ax in enumerate(ax_ts.flatten()):
+                    if i < CHANNELS:
+                        ax.clear()
+                        ax.plot(processed[i], linewidth=0.8)
+                        ax.set_ylim(-3, 3)
+                        ax.set_title(f'Ch {i+1}', fontsize=8)
+                        ax.set_xticks([])
+                        ax.grid(True, linestyle='--', alpha=0.6)
+                
+                fig_ts = ax_ts[0, 0].get_figure()
+                fig_ts.tight_layout(rect=[0.03, 0.03, 0.97, 0.97])
+                fig_ts.canvas.draw()
+                
+                # Update PSD plot
+                ax_psd.clear()
+                for ch in range(min(2, CHANNELS)):  # Show first 2 channels to avoid clutter
+                    freqs, psd = welch(processed[ch], fs=FS, nperseg=256)
+                    ax_psd.semilogy(freqs, psd, label=f'Ch {ch+1}', alpha=0.7)
+                
+                ax_psd.set_xlim(1, 45)
+                ax_psd.set_xlabel('Frequency (Hz)', fontsize=9)
+                ax_psd.set_ylabel('Power', fontsize=9)
+                ax_psd.set_title('Power Spectral Density', fontsize=10)
+                ax_psd.legend(fontsize=8)
+                ax_psd.grid(True, linestyle='--', alpha=0.6)
+                fig_psd = ax_psd.get_figure()
+                fig_psd.tight_layout()
+                fig_psd.canvas.draw()
+                
+                # Perform classification
+                if self.active_model == 'CNN':
+                    # CNN expects (samples, channels) format
+                    input_data = processed.T[np.newaxis, ...]
+                    prediction = self.cnn_model.predict(input_data, verbose=0)[0]
+                    confidence = np.max(prediction)
+                    class_idx = np.argmax(prediction)
+                else:  # SVM
+                    # Extract PSD features
+                    features = []
+                    for ch in range(CHANNELS):
+                        freqs, psd = welch(processed[ch], fs=FS, nperseg=self.win_len)
+                        for band in [(1, 4), (4, 7), (8, 12), (13, 30), (30, 45)]:
+                            band_mask = (freqs >= band[0]) & (freqs <= band[1])
+                            band_power = np.trapz(psd[band_mask], freqs[band_mask])
+                            features.append(band_power)
+                    
+                    # Predict
+                    proba = self.svm_model.predict_proba([features])[0]
+                    confidence = np.max(proba)
+                    class_idx = np.argmax(proba)
+                
+                # Update GUI
+                label = "Low Load" if class_idx == 0 else "High Load"
+                self.window['-PREDICTION-'].update(label)
+                self.window['-CONFIDENCE-'].update_bar(int(confidence * 100))
+                
+                # Apply confidence threshold
+                if confidence < threshold:
+                    self.window['-PREDICTION-'].update(text_color='red')
+                else:
+                    self.window['-PREDICTION-'].update(text_color='white')
+                
+                # Calculate and display latency
+                latency = (time.time() - start_time) * 1000
+                self.window['-LATENCY-'].update(f'{latency:.1f} ms')
+                
+                # Store for metrics
+                self.confidence_history.append(confidence)
+                self.latency_history.append(latency)
+                
+                # Log results
+                self.log.append([
+                    pd.Timestamp.now(),
+                    current_file,
+                    self.active_model,
+                    label,
+                    confidence,
+                    latency
+                ])
+                
+                # Control processing speed
+                time.sleep(max(0, 1/speed - latency/1000))
+                
+        except Exception as e:
+            self.window['-STATUS-'].print(f"Processing error: {str(e)}")
+            self.running = False
+            traceback.print_exc()
+    
+    def load_current_file(self):
+        """Load the current EEG file with validation"""
+        try:
+            filepath = os.path.join(DATA_DIR, self.data_files[self.file_index])
+            df = pd.read_csv(filepath)
+            
+            # Validate data shape
+            if df.shape[1] != CHANNELS:
+                self.window['-STATUS-'].print(
+                    f"Invalid channel count in {self.data_files[self.file_index]}: "
+                    f"Expected {CHANNELS}, got {df.shape[1]}"
+                )
+                return False
+                
+            self.current_data = df.values.T
+            self.window['-STATUS-'].print(
+                f"Loaded {self.data_files[self.file_index]} "
+                f"({self.current_data.shape[1]} samples)"
+            )
+            return True
+            
+        except Exception as e:
+            self.window['-STATUS-'].print(
+                f"Error loading {self.data_files[self.file_index]}: {str(e)}"
+            )
+            return False
+            
+    def run_benchmark(self, window):
+        """Run comprehensive performance benchmark without CNN for small windows"""
+        try:
+            self.window['-STATUS-'].print("Starting benchmark...")
+            
+            # Test different window sizes
+            window_sizes = [1, 2, 3]  # in seconds
+            noise_levels = [0, 20, 50, 80]  # noise percentage
+            
+            results = []
+            for win_size in window_sizes:
+                win_len_samples = win_size * FS
+                
+                for noise in noise_levels:
+                    # Test SVM only for this benchmark
+                    svm_time, svm_acc = self.test_model(
+                        'SVM', win_len_samples, noise/100.0
+                    )
+                    
+                    results.append({
+                        'window_size': win_size,
+                        'noise_level': noise,
+                        'svm_time': svm_time,
+                        'svm_acc': svm_acc
+                    })
+            
+            # Create results DataFrame
+            df = pd.DataFrame(results)
+            
+            # Save benchmark results
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            benchmark_file = os.path.join(BENCHMARK_DIR, f'benchmark_{timestamp}.csv')
+            df.to_csv(benchmark_file, index=False)
+            
+            # Format results for display
+            result_text = "=== Benchmark Results (SVM Only) ===\n"
+            result_text += f"Generated: {timestamp}\n"
+            result_text += f"Tested on window sizes: {window_sizes}s\n"
+            result_text += f"Tested noise levels: {noise_levels}%\n\n"
+            
+            # Add summary statistics
+            svm_avg_time = df['svm_time'].mean()
+            svm_avg_acc = df['svm_acc'].mean()
+            
+            result_text += f"SVM Average: {svm_avg_time:.2f} ms latency, {svm_avg_acc:.2%} accuracy\n\n"
+            
+            # Add detailed results
+            result_text += "Detailed Results:\n"
+            result_text += df.to_string()
+            
+            self.window['-BENCHMARK-RESULTS-'].update(result_text)
+            self.window['-STATUS-'].print(f"Benchmark complete! Results saved to {benchmark_file}")
+            
+            return True
+            
+        except Exception as e:
+            self.window['-STATUS-'].print(f"Benchmark failed: {str(e)}")
+            return False
+    
+    def test_model(self, model_type, win_len, noise_level):
+        """Test a single model configuration"""
+        # Load sample data
+        sample_file = os.path.join(DATA_DIR, "eeg_high_1.csv")
+        df = pd.read_csv(sample_file)
+        data = df.values.T[:, :win_len]  # First window
+        
+        # Add noise
+        noise = noise_level * np.random.normal(size=data.shape)
+        noisy_data = data + noise
+        
+        # Preprocess
+        processed = np.array([preprocess(ch) for ch in noisy_data])
+        
+        # Time prediction
+        start_time = time.perf_counter()
+        
+        if model_type == 'CNN':
+            # Skip CNN for benchmark to avoid errors
+            return 0, 0
+        else:  # SVM
+            # Extract features
+            features = []
+            for ch in range(CHANNELS):
+                freqs, psd = welch(processed[ch], fs=FS, nperseg=win_len)
+                for band in [(1, 4), (4, 7), (8, 12), (13, 30), (30, 45)]:
+                    band_mask = (freqs >= band[0]) & (freqs <= band[1])
+                    band_power = np.trapz(psd[band_mask], freqs[band_mask])
+                    features.append(band_power)
+            
+            # Predict
+            proba = self.svm_model.predict_proba([features])[0]
+            confidence = np.max(proba)
+            class_idx = np.argmax(proba)
+        
+        latency = (time.perf_counter() - start_time) * 1000
+        
+        # Since we're using high load data, accuracy is 1 if classified as high
+        accuracy = 1.0 if class_idx == 1 else 0.0
+        
+        return latency, accuracy
+        
+    def show_session_metrics(self, window):
+        """Show metrics from current session with robust error handling"""
+        if not self.log:
+            return False
+            
+        try:
+            # Create new figure for metrics
+            fig, axs = plt.subplots(2, 2, figsize=(10, 8))
+            fig.suptitle('Session Performance Metrics', fontsize=14)
+            
+            # Prepare data
+            df = pd.DataFrame(
+                self.log,
+                columns=['Timestamp', 'File', 'Model', 'Prediction', 'Confidence', 'Latency']
+            )
+            
+            # Prediction distribution
+            prediction_counts = df['Prediction'].value_counts()
+            axs[0, 0].bar(prediction_counts.index, prediction_counts.values, color=['blue', 'orange'])
+            axs[0, 0].set_title('Prediction Distribution', fontsize=10)
+            axs[0, 0].set_xlabel('Class', fontsize=9)
+            axs[0, 0].set_ylabel('Count', fontsize=9)
+            axs[0, 0].grid(True, linestyle='--', alpha=0.3)
+            
+            # Confidence over time
+            axs[0, 1].plot(df['Confidence'], 'b-')
+            axs[0, 1].set_title('Confidence Over Time', fontsize=10)
+            axs[0, 1].set_xlabel('Window', fontsize=9)
+            axs[0, 1].set_ylabel('Confidence', fontsize=9)
+            axs[0, 1].set_ylim(0, 1.05)
+            axs[0, 1].grid(True, linestyle='--', alpha=0.3)
+            
+            # Latency distribution
+            axs[1, 0].hist(df['Latency'], bins=20, color='green', alpha=0.7)
+            axs[1, 0].set_title('Latency Distribution', fontsize=10)
+            axs[1, 0].set_xlabel('Latency (ms)', fontsize=9)
+            axs[1, 0].set_ylabel('Frequency', fontsize=9)
+            axs[1, 0].grid(True, linestyle='--', alpha=0.3)
+            
+            # Model comparison (if multiple models used)
+            if 'CNN' in df['Model'].values and 'SVM' in df['Model'].values:
+                model_stats = df.groupby('Model')['Confidence'].agg(['mean', 'std'])
+                model_stats.plot(kind='bar', y='mean', yerr='std', 
+                               ax=axs[1, 1], capsize=4, alpha=0.7, color=['blue', 'orange'])
+                axs[1, 1].set_title('Model Performance', fontsize=10)
+                axs[1, 1].set_ylabel('Average Confidence', fontsize=9)
+                axs[1, 1].set_xticklabels(model_stats.index, rotation=0, fontsize=9)
+            else:
+                model = df['Model'].iloc[0] if len(df) > 0 else 'Unknown'
+                axs[1, 1].text(0.5, 0.5, f'Single model used: {model}', 
+                              horizontalalignment='center', verticalalignment='center',
+                              transform=axs[1, 1].transAxes, fontsize=11)
+                axs[1, 1].set_title('Model Comparison', fontsize=10)
+                axs[1, 1].axis('off')
+            
+            fig.tight_layout(pad=3.0)
+            
+            # Create new window for metrics
+            metrics_layout = [
+                [sg.Canvas(key='-METRICS-FIG-', size=(700, 500))],
+                [sg.Button('Close', size=10)]
+            ]
+            metrics_window = sg.Window('Session Metrics', metrics_layout, finalize=True)
+            
+            # Embed figure
+            canvas = FigureCanvasTkAgg(fig, metrics_window['-METRICS-FIG-'].TKCanvas)
+            canvas.draw()
+            canvas.get_tk_widget().pack(side='top', fill='both', expand=1)
+            
+            # Event loop for metrics window
+            while True:
+                event, _ = metrics_window.read()
+                if event in (sg.WINDOW_CLOSED, 'Close'):
+                    break
+                    
+            metrics_window.close()
+            return True
+            
+        except Exception as e:
+            self.window['-STATUS-'].print(f"Error showing metrics: {str(e)}")
+            return False
+
+# === Main Application ===
+def main():
+    try:
+        # Initialize GUI
+        window, fig_ts, ax_ts, fig_psd, ax_psd = create_window()
+        processor = EEGProcessor(window)
+        
+        # Populate file selector
+        file_list = ['All Files (Loop)'] + sorted(processor.data_files)
+        window['-FILE-SELECT-'].update(values=file_list, value='All Files (Loop)')
+        
+        # Event loop
+        while True:
+            event, values = window.read(timeout=100)
+            
+            if event in (sg.WINDOW_CLOSED, 'Exit'):
+                break
+                
+            elif event == 'Start':
+                window['Start'].update(disabled=True)
+                window['Stop'].update(disabled=False)
+                window['Train Models'].update(disabled=True)
+                window['Run Benchmark'].update(disabled=True)
+                
+                # Capture current parameters in main thread
+                source = 'simulation' if values['-SIMULATION-'] else 'live'
+                
+                params = {
+                    'source': source,
+                    'model_type': values['-MODEL-'],
+                    'noise_level': values['-NOISE-'],
+                    'speed': values['-SPEED-'],
+                    'threshold': values['-THRESHOLD-'],
+                    'win_size': values['-WIN-SIZE-'],
+                    'selected_file': values['-FILE-SELECT-']
+                }
+                
+                if processor.start(ax_ts, ax_psd, params):
+                    window['-STATUS-'].print("Processing started")
+                else:
+                    window['Start'].update(disabled=False)
+                    window['Stop'].update(disabled=True)
+                    window['Train Models'].update(disabled=False)
+                    window['Run Benchmark'].update(disabled=False)
+                    
+            elif event == 'Stop':
+                window['Start'].update(disabled=False)
+                window['Stop'].update(disabled=True)
+                window['Train Models'].update(disabled=False)
+                window['Run Benchmark'].update(disabled=False)
+                processor.stop()
+                window['-STATUS-'].print("Processing stopped")
+                
+            elif event == 'Train Models':
+                window['Start'].update(disabled=True)
+                window['Stop'].update(disabled=True)
+                window['Train Models'].update(disabled=True)
+                window['Run Benchmark'].update(disabled=True)
+                window.refresh()
+                
+                # Train models
+                cnn_acc, svm_acc, status = train_models(window)
+                window['-STATUS-'].print(status)
+                
+                # Reload models and update file list
+                processor.load_models()
+                processor.load_data()
+                file_list = ['All Files (Loop)'] + sorted(processor.data_files)
+                window['-FILE-SELECT-'].update(values=file_list, value='All Files (Loop)')
+                
+                window['Start'].update(disabled=False)
+                window['Stop'].update(disabled=True)
+                window['Train Models'].update(disabled=False)
+                window['Run Benchmark'].update(disabled=False)
+                
+            elif event == 'Run Benchmark':
+                window['Start'].update(disabled=True)
+                window['Stop'].update(disabled=True)
+                window['Train Models'].update(disabled=True)
+                window['Run Benchmark'].update(disabled=True)
+                window.refresh()
+                
+                # Run benchmark
+                processor.run_benchmark(window)
+                window['-METRICS-COL-'].update(visible=True)
+                
+                window['Start'].update(disabled=False)
+                window['Stop'].update(disabled=True)
+                window['Train Models'].update(disabled=False)
+                window['Run Benchmark'].update(disabled=False)
+                
+            elif event == '-SAVE-LOG-':
+                if processor.log:
+                    timestamp = time.strftime("%Y%m%d-%H%M%S")
+                    log_file = os.path.join(LOG_DIR, f'eeg_log_{timestamp}.csv')
+                    df = pd.DataFrame(
+                        processor.log,
+                        columns=['Timestamp', 'File', 'Model', 'Prediction', 'Confidence', 'Latency (ms)']
+                    )
+                    df.to_csv(log_file, index=False)
+                    window['-STATUS-'].print(f"Log saved as {log_file}")
+                    sg.popup(f'Log saved as:\n{log_file}')
+                else:
+                    sg.popup_error('No data to save!')
+                    
+            elif event == '-SHOW-METRICS-':
+                if processor.log:
+                    processor.show_session_metrics(window)
+                else:
+                    sg.popup_error('No session data to show!')
+                    
+            elif event in ('-NOISE-', '-THRESHOLD-'):
+                # Update confidence threshold visualization
+                if processor.log and processor.window['-PREDICTION-'].get() != 'N/A':
+                    confidence = float(processor.window['-CONFIDENCE-'].get())
+                    threshold = values['-THRESHOLD-'] / 100.0
+                    if confidence < threshold:
+                        window['-PREDICTION-'].update(text_color='red')
+                    else:
+                        window['-PREDICTION-'].update(text_color='white')
+        
+        processor.stop()
+        window.close()
+        
+    except Exception as e:
+        sg.popup_error(f"Critical error: {str(e)}\n\n{traceback.format_exc()}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
